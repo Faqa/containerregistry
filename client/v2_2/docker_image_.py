@@ -61,6 +61,17 @@ class DockerImage(six.with_metaclass(abc.ABCMeta, object)):
     """The unique set of blobs that compose to create the filesystem."""
     return set(self.fs_layers() + [self.config_blob()])
 
+  def distributable_blob_set(self):
+    """The unique set of blobs which are distributable."""
+    manifest = json.loads(self.manifest())
+    distributable_blobs = {
+        x['digest']
+        for x in reversed(manifest['layers'])
+        if x['mediaType'] not in docker_http.NON_DISTRIBUTABLE_LAYER_MIMES
+    }
+    distributable_blobs.add(self.config_blob())
+    return distributable_blobs
+
   def digest(self):
     """The digest of the manifest."""
     return docker_digest.SHA256(self.manifest().encode('utf8'))
@@ -118,6 +129,13 @@ class DockerImage(six.with_metaclass(abc.ABCMeta, object)):
       if this_diff_id == diff_id:
         return this_digest
     raise ValueError('Unmatched "diff_id": "%s"' % diff_id)
+
+  def digest_to_diff_id(self, digest):
+    for (this_digest, this_diff_id) in six.moves.zip(self.fs_layers(),
+                                                     self.diff_ids()):
+      if this_digest == digest:
+        return this_diff_id
+    raise ValueError('Unmatched "digest": "%s"' % digest)
 
   def layer(self, diff_id):
     """Like `blob()`, but accepts the `diff_id` instead.
@@ -424,7 +442,7 @@ class FromTarball(DockerImage):
     # https://mail.python.org/pipermail/python-bugs-list/2015-March/265999.html
     # so instead of locking, just open the tarfile for each file
     # we want to read.
-    with tarfile.open(name=self._tarball, mode='r:') as tar:
+    with tarfile.open(name=self._tarball, mode='r') as tar:
       try:
         # If the layer is compressed and we need to return compressed
         # or if it's uncompressed and we need to return uncompressed
@@ -477,16 +495,41 @@ class FromTarball(DockerImage):
     }
 
     blob_names = {}
-    for layer in self._layers:
-      content = self._gzipped_content(layer)
-      name = docker_digest.SHA256(content)
+
+    config = json.loads(self.config_file())
+    diff_ids = config['rootfs']['diff_ids']
+
+    for i, layer in enumerate(self._layers):
+      name = None
+      diff_id = diff_ids[i]
+      media_type = docker_http.LAYER_MIME
+      size = 0
+      urls = []
+
+      if diff_id in self._layer_sources:
+        # _layer_sources contains foreign layers from the base image
+        name = self._layer_sources[diff_id]['digest']
+        media_type = self._layer_sources[diff_id]['mediaType']
+        size = self._layer_sources[diff_id]['size']
+        if 'urls' in self._layer_sources[diff_id]:
+          urls = self._layer_sources[diff_id]['urls']
+      else:
+        content = self._gzipped_content(layer)
+        name = docker_digest.SHA256(content)
+        size = len(content)
+
       blob_names[name] = layer
-      manifest['layers'].append({
+
+      layer_manifest = {
           'digest': name,
-          # TODO(user): Do we need to sniff the file to detect this?
-          'mediaType': docker_http.LAYER_MIME,
-          'size': len(content),
-      })
+          'mediaType': media_type,
+          'size': size,
+      }
+
+      if urls:
+        layer_manifest['urls'] = urls
+
+      manifest['layers'].append(layer_manifest)
 
     with self._lock:
       self._manifest = manifest
@@ -555,6 +598,7 @@ class FromTarball(DockerImage):
 
     config = None
     layers = []
+    layer_sources = []
     # Find the right entry, either:
     # 1) We were supplied with an image name, which we must find in an entry's
     #   RepoTags, or
@@ -572,6 +616,7 @@ class FromTarball(DockerImage):
       if not self._name or str(self._name) in (entry.get('RepoTags') or []):
         config = entry.get('Config')
         layers = entry.get('Layers', [])
+        layer_sources = entry.get('LayerSources', {})
 
     if not config:
       raise ValueError('Unable to find %s in provided tarball.' % self._name)
@@ -579,6 +624,7 @@ class FromTarball(DockerImage):
     # Metadata from the tarball's configuration we need to construct the image.
     self._config_file = config
     self._layers = layers
+    self._layer_sources = layer_sources
 
     # We populate "manifest" and "blobs" lazily for two reasons:
     # 1) Allow use of this library for reading the config_file() from the image
@@ -614,15 +660,19 @@ class FromDisk(DockerImage):
         path to a file containing the second element's sha256.
         The second element is the .tar of a filesystem layer.
     legacy_base: Optionally, the path to a legacy base image in FromTarball form
+    foreign_layers_manifest: Optionally a tar manifest from the base
+        image that describes the ForeignLayers needed by this image.
   """
 
   def __init__(self,
                config_file,
                layers,
                uncompressed_layers = None,
-               legacy_base = None):
+               legacy_base = None,
+               foreign_layers_manifest = None):
     self._config = config_file
     self._manifest = None
+    self._foreign_layers_manifest = foreign_layers_manifest
     self._layers = []
     self._layer_to_filename = {}
     for (name_file, content_file) in layers:
@@ -645,10 +695,32 @@ class FromDisk(DockerImage):
       with FromTarball(legacy_base) as base:
         self._legacy_base = base
 
+  def _get_foreign_layers(self):
+    foreign_layers = []
+    if self._foreign_layers_manifest:
+      manifest = json.loads(self._foreign_layers_manifest)
+      if 'layers' in manifest:
+        for layer in manifest['layers']:
+          if layer['mediaType'] == docker_http.FOREIGN_LAYER_MIME:
+            foreign_layers.append(layer)
+    return foreign_layers
+
+  def _get_foreign_layer_by_digest(self, digest):
+    for foreign_layer in self._get_foreign_layers():
+      if foreign_layer['digest'] == digest:
+        return foreign_layer
+    return None
+
   def _populate_manifest(self):
     base_layers = []
     if self._legacy_base:
       base_layers = json.loads(self._legacy_base.manifest())['layers']
+    elif self._foreign_layers_manifest:
+      # Manifest files found in tar files are actually a json list.
+      # This code iterates through that collection and appends any foreign
+      # layers described in the order found in the config file.
+      base_layers += self._get_foreign_layers()
+
     # TODO(user): Update mimes here for oci_compat.
     self._manifest = json.dumps(
         {
@@ -687,8 +759,11 @@ class FromDisk(DockerImage):
   def uncompressed_blob(self, digest):
     """Override."""
     if digest not in self._layer_to_filename:
-      # Leverage the FromTarball fast-path.
-      return self._legacy_base.uncompressed_blob(digest)
+      if self._get_foreign_layer_by_digest(digest):
+        return bytes([])
+      else:
+        # Leverage the FromTarball fast-path.
+        return self._legacy_base.uncompressed_blob(digest)
     return super(FromDisk, self).uncompressed_blob(digest)
 
   def uncompressed_layer(self, diff_id):

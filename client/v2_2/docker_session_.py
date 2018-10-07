@@ -205,7 +205,9 @@ class Push(object):
     # repository that is known to contain this blob and skips the upload.
     self._patch_upload(image, digest)
 
-  def _remote_tag_digest(self):
+  def _remote_tag_digest(
+      self, image
+      ):
     """Check the remote for the given manifest by digest."""
 
     # GET the tag we're pushing
@@ -216,7 +218,8 @@ class Push(object):
         method='GET',
         accepted_codes=[
             six.moves.http_client.OK, six.moves.http_client.NOT_FOUND
-        ])
+        ],
+        accepted_mimes=[image.media_type()])
 
     if resp.status == six.moves.http_client.NOT_FOUND:  # pytype: disable=attribute-error
       return None
@@ -293,7 +296,7 @@ class Push(object):
     # checks (they must exist).
     if self._manifest_exists(image):
       if isinstance(self._name, docker_name.Tag):
-        if self._remote_tag_digest() == image.digest():
+        if self._remote_tag_digest(image) == image.digest():
           logging.info('Tag points to the right manifest, skipping push.')
           return
         logging.info('Manifest exists, skipping blob uploads and pushing tag.')
@@ -305,14 +308,14 @@ class Push(object):
         with child:
           self.upload(child, use_digest=True)
     elif self._threads == 1:
-      for digest in image.blob_set():
+      for digest in image.distributable_blob_set():
         self._upload_one(image, digest)
     else:
       with concurrent.futures.ThreadPoolExecutor(
           max_workers=self._threads) as executor:
         future_to_params = {
             executor.submit(self._upload_one, image, digest): (image, digest)
-            for digest in image.blob_set()
+            for digest in image.distributable_blob_set()
         }
         for future in concurrent.futures.as_completed(future_to_params):
           future.result()

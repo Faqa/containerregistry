@@ -29,6 +29,7 @@ from containerregistry.client.v1 import docker_image as v1_image
 from containerregistry.client.v1 import save as v1_save
 from containerregistry.client.v2 import v1_compat
 from containerregistry.client.v2_2 import docker_digest
+from containerregistry.client.v2_2 import docker_http
 from containerregistry.client.v2_2 import docker_image as v2_2_image
 from containerregistry.client.v2_2 import v2_compat
 
@@ -37,8 +38,11 @@ import six
 
 
 def _diff_id(v1_img, blob):
-  unzipped = v1_img.uncompressed_layer(blob)
-  return docker_digest.SHA256(unzipped)
+  try:
+    return v1_img.diff_id(blob)
+  except ValueError:
+    unzipped = v1_img.uncompressed_layer(blob)
+    return docker_digest.SHA256(unzipped)
 
 
 def multi_image_tarball(
@@ -89,7 +93,7 @@ def multi_image_tarball(
       tag_to_v1_image[tag] = v1_img
 
     # Add the manifests entry for this image.
-    manifests.append({
+    manifest = {
         'Config':
             digest + '.json',
         'Layers': [
@@ -97,10 +101,25 @@ def multi_image_tarball(
             # We don't just exclude the empty tar because we leave its diff_id
             # in the set when coming through v2_compat.V22FromV2
             for layer_id in reversed(v1_img.ancestry(v1_img.top()))
-            if _diff_id(v1_img, layer_id) in diffs
+            if _diff_id(v1_img, layer_id) in diffs and
+            not json.loads(v1_img.json(layer_id)).get('throwaway')
         ],
         'RepoTags': [str(tag)]
-    })
+    }
+
+    layer_sources = {}
+    input_manifest = json.loads(image.manifest())
+    input_layers = input_manifest['layers']
+
+    for input_layer in input_layers:
+      if input_layer['mediaType'] == docker_http.FOREIGN_LAYER_MIME:
+        diff_id = image.digest_to_diff_id(input_layer['digest'])
+        layer_sources[diff_id] = input_layer
+
+    if layer_sources:
+      manifest['LayerSources'] = layer_sources
+
+    manifests.append(manifest)
 
   # v2.2 tarballs are a superset of v1 tarballs, so delegate
   # to v1 to save itself.
