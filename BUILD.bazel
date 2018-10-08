@@ -23,10 +23,10 @@ py_library(
         "transport/**/*.py",
     ]),
     deps = [
-        "@concurrent//:concurrent",
-        "@httplib2_git//:httplib2",
-        "@oauth2client//:oauth2client",
+        "@concurrent_py2//:concurrent",
+        "@httplib2_py2_3//:httplib2",
         "@six_archive//:six",
+        "//httplib2:httplib2",
     ],
 )
 
